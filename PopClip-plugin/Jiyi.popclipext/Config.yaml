@@ -1,0 +1,19 @@
+# Jiyi PopClip extension
+# Sends the selected text to Jiyi via its `jiyi://` URL scheme.
+# The `***` placeholder is replaced by PopClip with the selected text,
+# already URL-encoded.
+name:
+  en: Jiyi
+  zh-hans: 寄译
+identifier: io.github.okayzk.Jiyi.popclip
+description:
+  en: Translate the selected text with Jiyi
+  zh-hans: 用寄译翻译所选文本
+icon: icon.png
+url: "jiyi://translate?text=***"
+app:
+  name: Jiyi
+  link: https://github.com/okayzk/Jiyi
+  checkInstalled: true
+  bundleIdentifiers:
+    - io.github.okayzk.Jiyi

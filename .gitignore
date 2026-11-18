@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+*.swp
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+*.xcodeproj/
+*.xcworkspace/
+
+# Generated icon assets — drawn by Scripts/generate-icons.swift on every build.
+# docs/icon.png (for the README) is committed: regenerate it with
+# `swift Scripts/generate-icons.swift --png docs/icon.png` after changing the drawing.
+Resources/AppIcon.icns
+Resources/AppIcon.iconset/
+Resources/AppIcon-preview.png
+Resources/MenuBarIcon.png
+
+# Runtime logs / app caches (handy locally, never useful in version control)
+/tmp/jiyi.log
+/tmp/jiyi-last-screenshot.png
+
+# PopClip extension package (built by PopClip-plugin/package.sh)
+PopClip-plugin/Jiyi.popclipextz
+dist/
+.tmp/
+.claude/release.local.md
+/build/
+# Private documents: a repository of their own (the private repo's `internal` branch),
+# linked back by internal/setup.sh
+/internal/
+/AGENTS.md
+/CLAUDE.md
+/.agents/
+/.claude/skills/

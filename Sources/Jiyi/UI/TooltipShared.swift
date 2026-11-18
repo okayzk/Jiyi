@@ -1,0 +1,393 @@
+import AppKit
+import AVFoundation
+import SwiftUI
+
+// MARK: - Visual effect background
+
+/// Shared NSVisualEffectView backdrop used by both the live tooltip and
+/// pinned notes. Corner radius is applied at the layer level so AppKit
+/// owns the rounded clip — this avoids the visible lag you get when SwiftUI
+/// tries to clip a hosted NSVisualEffectView during a frame-by-frame resize.
+struct VisualEffectBackground: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let cornerRadius: CGFloat
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.isEmphasized = true
+        view.wantsLayer = true
+        view.layer?.cornerRadius = cornerRadius
+        view.layer?.cornerCurve = .continuous
+        view.layer?.masksToBounds = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.layer?.cornerRadius = cornerRadius
+    }
+}
+
+// MARK: - Adaptive glass surface
+
+/// Shared surface modifier for translation popovers.
+///
+/// On macOS 26+ with a Swift 6.2+ toolchain this uses native Liquid Glass.
+/// Older compilers or runtime OS versions keep the established AppKit
+/// `NSVisualEffectView` material, so the package still builds and runs on
+/// macOS 14+.
+struct AdaptiveGlassSurface: ViewModifier {
+    enum Border {
+        case none
+        /// Native Liquid Glass already carries its own edge treatment, so
+        /// this only draws in fallback mode.
+        case subtle
+        /// Used by pinned notes so they remain visually distinct from the
+        /// live tooltip in both native and fallback modes.
+        case accent
+    }
+
+    let cornerRadius: CGFloat
+    var fallbackMaterial: NSVisualEffectView.Material = .toolTip
+    var border: Border = .subtle
+
+    func body(content: Content) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            liquidGlassSurface(content)
+        } else {
+            fallbackSurface(content)
+        }
+        #else
+        fallbackSurface(content)
+        #endif
+    }
+
+    @ViewBuilder
+    private func fallbackSurface(_ content: Content) -> some View {
+        content
+            .background(VisualEffectBackground(material: fallbackMaterial, cornerRadius: cornerRadius))
+            .overlay(borderOverlay(nativeGlass: false))
+    }
+
+    #if compiler(>=6.2)
+    @available(macOS 26.0, *)
+    @ViewBuilder
+    private func liquidGlassSurface(_ content: Content) -> some View {
+        content
+            .glassEffect(
+                .regular,
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
+            .overlay(borderOverlay(nativeGlass: true))
+    }
+    #endif
+
+    @ViewBuilder
+    private func borderOverlay(nativeGlass: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        switch border {
+        case .none:
+            EmptyView()
+        case .subtle:
+            if !nativeGlass {
+                shape.strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
+            }
+        case .accent:
+            shape.strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Collapsible section
+
+/// Smoothly animates an inline section from height `0` to its measured
+/// natural height (and back) by always keeping a hidden measurement copy in
+/// the layout. The visible copy fades while the container's height
+/// interpolates between the two endpoints — SwiftUI owns the whole
+/// animation, AppKit only follows the SwiftUI fitting size frame-by-frame.
+struct CollapsibleSection<Content: View>: View {
+    let isExpanded: Bool
+    let animation: Animation
+    @ViewBuilder var content: () -> Content
+
+    @State private var measuredHeight: CGFloat = 0
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            content()
+                .fixedSize(horizontal: false, vertical: true)
+                .readHeight { measuredHeight = $0 }
+                .opacity(0)
+                .allowsHitTesting(false)
+
+            content()
+                .fixedSize(horizontal: false, vertical: true)
+                .opacity(isExpanded ? 1 : 0)
+        }
+        .frame(height: isExpanded ? measuredHeight : 0, alignment: .top)
+        .clipped()
+        .animation(animation, value: isExpanded)
+    }
+}
+
+// MARK: - Preference keys + size / height readers
+
+struct HeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+struct SizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        if next.width > 0, next.height > 0 {
+            value = next
+        }
+    }
+}
+
+extension View {
+    func readHeight(_ onChange: @escaping (CGFloat) -> Void) -> some View {
+        background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: HeightPreferenceKey.self, value: proxy.size.height)
+            }
+        )
+        .onPreferenceChange(HeightPreferenceKey.self, perform: onChange)
+    }
+
+    func readSize(_ onChange: @escaping (CGSize) -> Void) -> some View {
+        background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: SizePreferenceKey.self, value: proxy.size)
+            }
+        )
+        .onPreferenceChange(SizePreferenceKey.self, perform: onChange)
+    }
+}
+
+// MARK: - Markdown rendering
+
+enum TooltipMarkdown {
+    /// Inline-only parse that always returns *something*. Block elements
+    /// (headings, code fences) get collapsed to plain text — that's fine
+    /// because our `<jiyi-desc>` is conventional inline-style content.
+    static func render(_ source: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            failurePolicy: .returnPartiallyParsedIfPossible
+        )
+        if let attr = try? AttributedString(markdown: source, options: options) {
+            return attr
+        }
+        return AttributedString(source)
+    }
+}
+
+/// Indented explanation block with an accent-coloured leading bar.
+/// Shared between live tooltip and pinned notes so the look stays in sync.
+/// Generous line spacing keeps multi-line descriptions from feeling cramped;
+/// the leading bar runs the full height of the rendered text.
+struct TooltipDescription: View {
+    let markdown: String
+
+    var body: some View {
+        // Collapse the model's `\n\n` paragraph breaks to single newlines —
+        // SwiftUI's markdown renderer turns each blank line into a hefty
+        // paragraph gap that looks airy inside a small tooltip section.
+        // After the collapse `lineSpacing(2)` still gives readable
+        // multi-line copy without the "balloon" feel.
+        Text(TooltipMarkdown.render(compactedMarkdown))
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 10)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.45))
+                    .frame(width: 2)
+            }
+    }
+
+    /// Squeeze runs of 2+ newlines down to a single newline so the rendered
+    /// markdown doesn't leave a tall blank line between a bold header (e.g.
+    /// `**💡 解释**`) and its body paragraph.
+    private var compactedMarkdown: String {
+        markdown
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n{2,}", with: "\n", options: .regularExpression)
+    }
+}
+
+// MARK: - Shared sizing rules
+
+/// Width rules used by both the live tooltip and pinned notes.
+///
+/// The two views render the same kind of content (translation segments)
+/// and would visibly drift if they computed widths independently. Anyone
+/// changing the threshold or the wide/narrow values should do it here so
+/// pinned notes stay visually consistent with the live tooltip they were
+/// captured from.
+enum TooltipSizing {
+    static let narrowWidth: CGFloat = 320
+    static let wideWidth: CGFloat = 480
+    /// Dictionary entries carry a longer typographic line (21pt headword,
+    /// 14pt body) than a plain translation, so the narrow 320pt column
+    /// wraps them twice as often as it should. This width only applies
+    /// while a dictionary segment is on screen.
+    static let dictionaryWidth: CGFloat = 400
+
+    /// Long-source threshold: anything beyond ~one English sentence (or
+    /// containing a newline) reads better in the wider column. Below this
+    /// the narrow width gives single words / short phrases the tighter,
+    /// more iconic look they deserve.
+    static func preferredWidth(forSource source: String, hasDictionary: Bool = false) -> CGFloat {
+        if hasDictionary {
+            return dictionaryWidth
+        }
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count > 80 || trimmed.contains("\n") {
+            return wideWidth
+        }
+        return narrowWidth
+    }
+}
+
+// MARK: - Live tooltip layout state
+
+/// Carries the maximum height the tooltip's scrollable content can occupy.
+///
+/// `FloatingPanelController` updates this whenever the panel's position
+/// changes (on initial `show`, on `setContentSize`, and on every drag
+/// completion). The SwiftUI view applies it as `frame(maxHeight: ...)`
+/// on its inner `ScrollView`, so:
+///
+///   - When natural content height ≤ `maxContentHeight`, the ScrollView
+///     reports the content's natural height and shows no scroll bar.
+///   - When natural content height > `maxContentHeight`, the ScrollView
+///     caps at that height and a scroll bar appears.
+///
+/// Drag the panel to a screen position with more room above the bottom
+/// edge, and the limit grows; if the content now fits, the scroll bar
+/// disappears automatically.
+@MainActor
+final class TooltipLayout: ObservableObject {
+    /// `.infinity` means "no cap" — used during the very first layout pass
+    /// before the controller has measured the screen.
+    @Published var maxContentHeight: CGFloat = .infinity
+}
+
+// MARK: - Window drag handle
+
+/// A transparent AppKit shim used as the `.background` of a SwiftUI view
+/// to make that region drag the enclosing `NSWindow` when the user
+/// presses-and-drags. Layered behind the tooltip's header HStack so the
+/// model-name strip + spacer area initiate window drag, while the inline
+/// buttons (refresh / pin / close) continue to capture their own clicks
+/// because they sit *on top* of the background.
+///
+/// Pairs with `panel.isMovable = true`. Cursor switches to `openHand`
+/// when hovering over the drag area so the affordance is discoverable.
+struct WindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        DragInitiatorView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class DragInitiatorView: NSView {
+    private var trackingArea: NSTrackingArea?
+
+    override func mouseDown(with event: NSEvent) {
+        // performDrag enters a modal mouse-tracking loop owned by the
+        // window server; it returns when the user releases the mouse.
+        window?.performDrag(with: event)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        // `.cursorUpdate` lets us swap the cursor only while the mouse is
+        // over the drag region — no global cursor stack manipulation.
+        // `.inVisibleRect` keeps the tracking area aligned with our
+        // (possibly resized) bounds automatically.
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.cursorUpdate, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.openHand.set()
+    }
+}
+
+// MARK: - Speech
+
+/// Tiny `AVSpeechSynthesizer` wrapper used by tooltip footers to pronounce
+/// the source text when the phonetic pill is tapped. Picks a voice whose
+/// language matches the detected language of the text.
+@MainActor
+final class TooltipSpeaker {
+    private let synthesizer = AVSpeechSynthesizer()
+
+    func speak(_ text: String) {
+        speak(text, language: nil)
+    }
+
+    /// Speak with an explicit BCP-47 language when the caller knows the
+    /// accent (dictionary UK/US labels). Falls back to detected-language
+    /// voice selection when no matching voice is installed.
+    func speak(_ text: String, language: String?) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        synthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: trimmed)
+        if let language, let voice = AVSpeechSynthesisVoice(language: language) {
+            utterance.voice = voice
+        } else {
+            utterance.voice = Self.voice(for: trimmed)
+        }
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.9
+        synthesizer.speak(utterance)
+    }
+
+    func stop() {
+        synthesizer.stopSpeaking(at: .immediate)
+    }
+
+    /// Detected tags look like "en" / "zh-Hans" while installed voices are
+    /// region-tagged ("en-US" / "zh-CN"), so match on the primary subtag
+    /// and let the system default fill in when nothing is installed.
+    private static func voice(for text: String) -> AVSpeechSynthesisVoice? {
+        let detected = LanguageDetector.detect(text)?.code ?? "en"
+        let primary = detected.split(separator: "-").first.map(String.init) ?? detected
+        let preferred: String? = switch detected {
+        case "zh-Hans": "zh-CN"
+        case "zh-Hant": "zh-TW"
+        default: nil
+        }
+        if let preferred, let voice = AVSpeechSynthesisVoice(language: preferred) {
+            return voice
+        }
+        return AVSpeechSynthesisVoice.speechVoices()
+            .first { $0.language.hasPrefix(primary + "-") || $0.language == primary }
+    }
+}
